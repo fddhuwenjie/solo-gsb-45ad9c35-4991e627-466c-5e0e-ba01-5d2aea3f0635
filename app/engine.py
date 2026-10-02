@@ -28,6 +28,15 @@
 并截断到窗口，在合并后的时间边界上扫描全体成员同时在场的连续片段；
 成员反复进出会形成多个候选片段，只有窗口内持续时长达到（含）门槛的片段
 才算通过，任一达标即整体通过，无达标片段即失败。
+
+设备接力交班核验：任务指定 2～8 台按交班顺序排列的设备、有效窗口
+[start, end)、相邻交班允许的最大空档与最短交叠时长。由 enter/leave
+事件还原各设备截断到窗口的半开在场区间（多次进出形成多个候选区间），
+以动态规划选择一条连续交班链使通过的相邻交班步数最多；并列时按
+（链首区间起端、）各步接班时刻字典序最早。相邻两台设备的区间相交时
+交叠须达到最短时长，分离（含端点相接）时空档须不超过最大值；每次
+接班区间起端不得早于上一步接班时刻。首个无法满足的交班步按缺席 /
+空档超限 / 交叠不足标记并给出首个违规时刻，后续交班一律不再到达。
 """
 from __future__ import annotations
 
@@ -853,4 +862,321 @@ def compute_rendezvous_report(
         min_co_presence_s=min_co_presence_s,
         members=ordered_members,
         segments=segments,
+    )
+
+
+# ---------- 设备接力交班核验 ----------
+
+
+RELAY_STEP_PASSED = "passed"                # 相邻交班达标（交叠够长或空档不超限）
+RELAY_STEP_ABSENT = "absent"                # 接班设备在交班时机无可用在场区间
+RELAY_STEP_GAP_EXCEEDED = "gap_exceeded"    # 两区间分离且空档超过最大允许值
+RELAY_STEP_OVERLAP_INSUFFICIENT = "overlap_insufficient"  # 两区间相交但交叠不足
+RELAY_STEP_NOT_REACHED = "not_reached"      # 此前已失败，该交班不再进行
+
+RELAY_DEVICE_PRESENT = "present"    # 设备已选入交班链，给出其实际区间
+RELAY_DEVICE_FAILED = "failed"      # 设备在场但该步交班未达标，给出其实际区间
+RELAY_DEVICE_ABSENT = "absent"      # 设备在窗口内缺席（或无满足时间推进的区间）
+RELAY_DEVICE_NOT_REACHED = "not_reached"  # 交班链此前已终止，该设备不参与核验
+
+
+@dataclass
+class RelayStep:
+    """一次相邻交班（devices[position] -> devices[position+1]）的核验结果。"""
+
+    position: int                    # 交班步序号（从 0 起，共 len(devices)-1 步）
+    from_device: str
+    to_device: str
+    status: str
+    takeover_ts: float | None = None   # 接班设备实际区间起端（接班时刻）；未达成为 None
+    from_interval: tuple[float, float] | None = None  # 交班设备选中的实际（截断）区间
+    to_interval: tuple[float, float] | None = None    # 接班设备实际（截断）区间；缺席为 None
+    overlap_s: float | None = None      # 实际交叠秒数；两区间相交时给出
+    gap_s: float | None = None          # 实际空档秒数；两区间分离（含端点相接）时给出
+    first_violation_ts: float | None = None  # 该步首个违规时刻；达标为 None
+
+
+@dataclass
+class RelayDeviceResult:
+    """交班链中单台设备的实际区间与状态。"""
+
+    position: int
+    device_id: str
+    status: str
+    interval: tuple[float, float] | None = None  # 设备选中的实际（截断）区间；无区间为 None
+
+
+@dataclass
+class RelayReport:
+    """接力交班核验报告：devices 按交班顺序，steps 为相邻交班步。"""
+
+    start: float
+    end: float
+    max_gap_s: float
+    min_overlap_s: float
+    members: tuple[str, ...]
+    devices: list[RelayDeviceResult]
+    steps: list[RelayStep]
+
+    @property
+    def passed_steps(self) -> int:
+        return sum(1 for s in self.steps if s.status == RELAY_STEP_PASSED)
+
+    @property
+    def passed(self) -> bool:
+        return len(self.steps) > 0 and all(
+            s.status == RELAY_STEP_PASSED for s in self.steps
+        )
+
+    @property
+    def first_violation_ts(self) -> float | None:
+        # steps 按顺序构造，第一个非 not_reached 的失败步即链终止步
+        for s in self.steps:
+            if s.first_violation_ts is not None:
+                return s.first_violation_ts
+        return None
+
+
+def _relay_presence_intervals(
+    events: list[tuple[str, str, float]],
+) -> list[tuple[str, float, float]]:
+    """由 enter/leave 事件重放每台设备的半开在场区间（接力交班语义）。
+
+    与 presence_intervals 的唯一区别：同一时刻同设备事件按 leave 先于
+    enter 应用——同刻 leave+enter 表示旧区间在 t 闭合（止端不含 t）、
+    新区间从 t 开始（起端含 t），形成两个端点相接的区间，保留各自的
+    交叠/空档判定。未配对的 enter（最终仍未离开）止端取 +inf。
+    """
+    by_device: dict[str, list[tuple[float, str]]] = {}
+    for device_id, etype, ts in events:
+        if etype in (EVENT_ENTER, EVENT_LEAVE):
+            by_device.setdefault(device_id, []).append((ts, etype))
+
+    intervals: list[tuple[str, float, float]] = []
+    for device_id, evs in by_device.items():
+        evs.sort(key=lambda x: (x[0], 0 if x[1] == EVENT_LEAVE else 1))
+        open_since: float | None = None
+        for ts, etype in evs:
+            if etype == EVENT_LEAVE:
+                if open_since is not None:
+                    intervals.append((device_id, open_since, ts))
+                    open_since = None
+            else:
+                if open_since is None:
+                    open_since = ts
+        if open_since is not None:
+            intervals.append((device_id, open_since, math.inf))
+    return intervals
+
+
+def _clipped_intervals(
+    events: list[tuple[str, str, float]],
+    members: list[str],
+    start: float,
+    end: float,
+) -> list[list[tuple[float, float]]]:
+    """还原各成员的半开在场区间并截断到 [start, end)，按交班顺序返回。
+
+    窗口前已进入的区间起端截到 start；窗口结束仍未离开的区间止端截到 end；
+    与窗口无正长度交集的区间丢弃。多次进出（含同刻离开又进入）形成多个
+    候选，按起端升序。
+    """
+    by_device: dict[str, list[tuple[float, float]]] = {}
+    for device_id, s, e in _relay_presence_intervals(events):
+        by_device.setdefault(device_id, []).append((s, e))
+
+    clipped: list[list[tuple[float, float]]] = []
+    for dev in members:
+        ivs: list[tuple[float, float]] = []
+        for s, e in by_device.get(dev, []):
+            cs, ce = max(s, start), min(e, end)
+            if cs < ce:
+                ivs.append((cs, ce))
+        ivs.sort()
+        clipped.append(ivs)
+    return clipped
+
+
+def _handover_ok(
+    a: tuple[float, float],
+    b: tuple[float, float],
+    max_gap_s: float,
+    min_overlap_s: float,
+) -> bool:
+    """判定相邻交班的两个半开区间是否满足空档/交叠要求。
+
+    - 相交（a 的止端严格晚于 b 的起端，b 起端的 enter 在半开语义下仍与 a 重叠）：
+      交叠长度 min(a.end, b.end) - b.start 须 >= min_overlap_s（含等于）。
+    - 分离（含端点相接 a.end == b.start，半开下二者不重叠）：
+      空档 b.start - a.end 须 <= max_gap_s（含等于）。
+    """
+    overlap = min(a[1], b[1]) - b[0]
+    if b[0] < a[1]:
+        return overlap >= min_overlap_s
+    return b[0] - a[1] <= max_gap_s
+
+
+def _classify_handover_failure(
+    a: tuple[float, float],
+    candidates: list[tuple[float, float]],
+    start: float,
+    end: float,
+    max_gap_s: float,
+    min_overlap_s: float,
+) -> tuple[str, tuple[float, float] | None, float]:
+    """在无任何候选能完成交班时，确定失败类别、实际区间与首个违规时刻。
+
+    candidates 为接班设备满足时间推进（起端 >= a 起端）的全部区间，按起端升序。
+    判定顺序与半开边界：
+    - 存在与 a 相交（b.start < a.end）的区间：交叠最早在 min(a.end, b.end)
+      确定不足，报 overlap_insufficient，实际区间取最早结束的相交区间；
+    - 仅存在分离区间：最早区间到达时若空档已超 max_gap_s（含等于算超限），
+      在空档耗尽时刻 a.end + max_gap_s 报 gap_exceeded（超出窗口截到 end）；
+    - 无候选（窗口内缺席，或仅有早于交班时刻的区间）：报 absent，
+      首个违规时刻为空档耗尽时刻；接班窗口此前已结束则取窗口止端。
+    """
+    overlapping = [b for b in candidates if b[0] < a[1]]
+    if overlapping:
+        b = min(overlapping, key=lambda iv: min(a[1], iv[1]))
+        return RELAY_STEP_OVERLAP_INSUFFICIENT, b, min(a[1], b[1])
+
+    gap_deadline = min(a[1] + max_gap_s, end)
+    if candidates:
+        # 调用方仅在无任何候选达标时进入本函数；最早（起端最早）的分离
+        # 候选此时必然已超 max_gap_s，否则它本应成为通过的接班区间。
+        b = candidates[0]
+        return RELAY_STEP_GAP_EXCEEDED, b, gap_deadline
+    return RELAY_STEP_ABSENT, None, gap_deadline
+
+
+def compute_relay_report(
+    events: list[tuple[str, str, float]],
+    members: list[str],
+    start: float,
+    end: float,
+    max_gap_s: float,
+    min_overlap_s: float,
+) -> RelayReport:
+    """由 enter/leave 事件还原接力交班链核验报告。
+
+    每个成员的在场区间截断到窗口 [start, end)；交班自首台设备起沿顺序
+    逐台进行，动态规划选择使**通过的相邻交班步数最多**的连续链：链首可
+    选任意首台区间，每步接班区间起端不得早于上一步接班时刻（时间推进，
+    与同设备多次进出形成的多个候选逐一比较），并满足交叠/空档要求。
+
+    步数并列时按（链首区间起端、）各步接班时刻构成的序列字典序最早取链。
+    链在第一个无法满足的交班步终止：按 absent / gap_exceeded /
+    overlap_insufficient 标记该步并给出首个违规时刻与接班设备实际区间
+    （缺席为 null），其后各步一律 not_reached、其后设备一律 not_reached。
+    """
+    intervals = _clipped_intervals(events, members, start, end)
+
+    device_results = [
+        RelayDeviceResult(position=i, device_id=dev, status=RELAY_DEVICE_NOT_REACHED)
+        for i, dev in enumerate(members)
+    ]
+    steps = [
+        RelayStep(position=i, from_device=members[i], to_device=members[i + 1],
+                  status=RELAY_STEP_NOT_REACHED)
+        for i in range(len(members) - 1)
+    ]
+
+    # 链首缺席：无任何交班可进行，首个违规时刻取窗口止端（交班窗口耗尽）
+    if not intervals[0]:
+        device_results[0].status = RELAY_DEVICE_ABSENT
+        steps[0].status = RELAY_STEP_ABSENT
+        steps[0].first_violation_ts = end
+        return RelayReport(
+            start=start, end=end, max_gap_s=max_gap_s, min_overlap_s=min_overlap_s,
+            members=tuple(members), devices=device_results, steps=steps,
+        )
+
+    # DP：levels[i] 保存“交班链在设备 i 处结束”的全部候选状态。
+    # 状态签名 sig = (链首区间起端, 各步接班时刻...)，长度 i+1，可直接回溯；
+    # 值为 (本设备选中区间, 上一级签名)。同签名只保留一条
+    # （链首与各步接班时刻均相同，后续可行性一致）。
+    level0: dict[tuple[float, ...], tuple[tuple[float, float], tuple | None]] = {
+        (iv[0],): (iv, None) for iv in intervals[0]
+    }
+    levels: list[dict] = [level0]
+    for i in range(1, len(members)):
+        cur: dict[tuple[float, ...], tuple[tuple[float, float], tuple]] = {}
+        for psig, (a, _parent) in levels[i - 1].items():
+            # 上一步接班时刻：首步用链首区间起端，其后取签名最后一项
+            takeover_prev = psig[0] if i == 1 else psig[-1]
+            for b in intervals[i]:
+                if b[0] < takeover_prev:
+                    continue  # 接班区间起端早于上一步接班时刻：时间倒退
+                if not _handover_ok(a, b, max_gap_s, min_overlap_s):
+                    continue
+                sig = (*psig, b[0])
+                if sig not in cur:
+                    cur[sig] = (b, psig)
+        levels.append(cur)
+
+    # 最高非空层 = 通过步数最多；并列按（各步接班时刻、链首起端）字典序最早
+    best_i = max(i for i, lv in enumerate(levels) if lv)
+    best_sig = min(levels[best_i], key=lambda sig: (sig[1:], sig[0]))
+
+    # 沿 parent 指针回溯各设备选中区间
+    selected: list[tuple[float, float]] = []
+    sig: tuple[float, ...] | None = best_sig
+    for i in range(best_i, -1, -1):
+        iv, sig = levels[i][sig]
+        selected.append(iv)
+    selected.reverse()
+
+    # 链内设备：实际区间 + present
+    for i in range(best_i + 1):
+        device_results[i].status = RELAY_DEVICE_PRESENT
+        device_results[i].interval = selected[i]
+
+    # 已通过各步
+    for j in range(best_i):
+        a, b = selected[j], selected[j + 1]
+        steps[j].status = RELAY_STEP_PASSED
+        steps[j].takeover_ts = b[0]
+        steps[j].from_interval = a
+        steps[j].to_interval = b
+        if b[0] < a[1]:
+            steps[j].overlap_s = min(a[1], b[1]) - b[0]
+        else:
+            steps[j].gap_s = b[0] - a[1]
+
+    # 终止步：best_i+1 的设备无法接 best_i 设备的班
+    if best_i < len(members) - 1:
+        j = best_i
+        a = selected[best_i]
+        # 时间推进基准与 DP 转移一致：首步看链首起端，其后看上一步接班时刻
+        takeover_prev = best_sig[0] if best_i == 0 else best_sig[-1]
+        candidates = [iv for iv in intervals[best_i + 1] if iv[0] >= takeover_prev]
+        status, to_iv, violation_ts = _classify_handover_failure(
+            a, candidates, start, end, max_gap_s, min_overlap_s
+        )
+        steps[j].status = status
+        steps[j].from_interval = a
+        steps[j].to_interval = to_iv
+        steps[j].first_violation_ts = violation_ts
+        dev = device_results[best_i + 1]
+        if status == RELAY_STEP_ABSENT:
+            dev.status = RELAY_DEVICE_ABSENT
+        else:
+            dev.status = RELAY_DEVICE_FAILED
+            dev.interval = to_iv
+            if to_iv is not None:
+                steps[j].takeover_ts = to_iv[0]
+                if to_iv[0] < a[1]:
+                    steps[j].overlap_s = min(a[1], to_iv[1]) - to_iv[0]
+                else:
+                    steps[j].gap_s = to_iv[0] - a[1]
+        # 其后设备保持 not_reached；其后 steps 保持 not_reached
+
+    return RelayReport(
+        start=start,
+        end=end,
+        max_gap_s=max_gap_s,
+        min_overlap_s=min_overlap_s,
+        members=tuple(members),
+        devices=device_results,
+        steps=steps,
     )

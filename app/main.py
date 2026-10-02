@@ -23,6 +23,7 @@ from .engine import (
     compute_events,
     compute_inspection_report,
     compute_occupancy_segments,
+    compute_relay_report,
     compute_rendezvous_report,
     project_points,
 )
@@ -37,6 +38,8 @@ from .models import (
     GateLineRow,
     InspectionCheckpointRow,
     InspectionRouteRow,
+    RelayMemberRow,
+    RelayTask,
     RendezvousMemberRow,
     RendezvousTask,
     TrackPointRow,
@@ -67,6 +70,12 @@ from .schemas import (
     OccupancyOut,
     OccupancySegmentOut,
     PointBatch,
+    RelayDeviceOut,
+    RelayIntervalOut,
+    RelayReportOut,
+    RelayStepOut,
+    RelayTaskCreate,
+    RelayTaskOut,
     RendezvousReportOut,
     RendezvousSegmentOut,
     RendezvousTaskCreate,
@@ -98,8 +107,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算、定向门线穿越核算、应急清场核验与协同到场核验",
-    version="1.5.0",
+                "支持围栏容量核算、定向门线穿越核算、应急清场核验、协同到场核验与设备接力交班核验",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -259,6 +268,15 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
             RendezvousMemberRow.task_id.in_(task_ids)
         ).delete(synchronize_session=False)
     db.query(RendezvousTask).filter_by(fence_id=fence_id).delete()
+    relay_task_ids = [
+        t[0]
+        for t in db.query(RelayTask.id).filter_by(fence_id=fence_id).all()
+    ]
+    if relay_task_ids:
+        db.query(RelayMemberRow).filter(
+            RelayMemberRow.task_id.in_(relay_task_ids)
+        ).delete(synchronize_session=False)
+    db.query(RelayTask).filter_by(fence_id=fence_id).delete()
     route_ids = [
         r[0]
         for r in db.query(InspectionRouteRow.id).filter_by(fence_id=fence_id).all()
@@ -1128,6 +1146,182 @@ def rendezvous_report(fence_id: int, task_id: int, db: Session = Depends(get_db)
                 members=list(s.members),
             )
             for s in report.segments
+        ],
+    )
+
+
+# ---------- 设备接力交班核验 ----------
+
+
+def _relay_members(db: Session, task_id: int) -> list[str]:
+    rows = (
+        db.query(RelayMemberRow)
+        .filter_by(task_id=task_id)
+        .order_by(RelayMemberRow.position)
+        .all()
+    )
+    return [r.device_id for r in rows]
+
+
+def relay_task_out(db: Session, task: RelayTask) -> RelayTaskOut:
+    return RelayTaskOut(
+        id=task.id,
+        fence_id=task.fence_id,
+        name=task.name,
+        devices=_relay_members(db, task.id),
+        start_at=to_iso(task.start_ts),
+        end_at=to_iso(task.end_ts),
+        max_gap_s=task.max_gap_s,
+        min_overlap_s=task.min_overlap_s,
+        created_at=to_iso(task.created_at),
+    )
+
+
+def _get_relay_task(db: Session, fence_id: int, task_id: int) -> RelayTask:
+    task = db.get(RelayTask, task_id)
+    if task is None or task.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="接力交班任务不存在")
+    return task
+
+
+@app.post(
+    "/fences/{fence_id}/relay-tasks",
+    response_model=RelayTaskOut,
+    status_code=201,
+)
+def create_relay_task(
+    fence_id: int, body: RelayTaskCreate, db: Session = Depends(get_db)
+):
+    """创建设备接力交班任务：2～8 台按交班顺序排列且不重复的设备。
+
+    同时设置有效窗口（start 严格早于 end）、相邻交班允许的最大空档与最短
+    交叠时长（两者均为非负秒数）；设备数量、去重或窗口不合法返回 422，
+    围栏不存在返回 404。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    start_ts, end_ts = to_epoch(body.start_at), to_epoch(body.end_at)
+    if not start_ts < end_ts:
+        raise HTTPException(status_code=422, detail="开始时刻必须早于结束时刻")
+
+    task = RelayTask(
+        fence_id=fence_id,
+        name=body.name,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        max_gap_s=body.max_gap_s,
+        min_overlap_s=body.min_overlap_s,
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(task)
+    db.flush()  # 取得 task.id
+    for position, device_id in enumerate(body.devices):
+        db.add(RelayMemberRow(
+            task_id=task.id, position=position, device_id=device_id
+        ))
+    db.commit()
+    db.refresh(task)
+    return relay_task_out(db, task)
+
+
+@app.get(
+    "/fences/{fence_id}/relay-tasks",
+    response_model=list[RelayTaskOut],
+)
+def list_relay_tasks(fence_id: int, db: Session = Depends(get_db)):
+    """列出围栏的接力交班任务（按 id 升序），设备按交班顺序。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    tasks = (
+        db.query(RelayTask)
+        .filter_by(fence_id=fence_id)
+        .order_by(RelayTask.id)
+        .all()
+    )
+    return [relay_task_out(db, t) for t in tasks]
+
+
+@app.delete(
+    "/fences/{fence_id}/relay-tasks/{task_id}",
+    status_code=204,
+)
+def delete_relay_task(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    task = _get_relay_task(db, fence_id, task_id)
+    db.query(RelayMemberRow).filter_by(task_id=task.id).delete()
+    db.delete(task)
+    db.commit()
+
+
+def _relay_interval_out(iv: tuple[float, float] | None) -> RelayIntervalOut | None:
+    if iv is None:
+        return None
+    return RelayIntervalOut(start=to_iso(iv[0]), end=to_iso(iv[1]))
+
+
+@app.get(
+    "/fences/{fence_id}/relay-tasks/{task_id}/report",
+    response_model=RelayReportOut,
+)
+def relay_report(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    """查询设备接力交班核验报告：每次由当前 enter/leave 事件实时重建，不保留旧结果。
+
+    从事件还原各设备截断到有效窗口的半开在场区间（多次进出形成多个候选），
+    沿交班顺序选择一条连续交班链使通过的相邻交班步数最多；并列时按各步
+    接班时刻字典序最早。相邻区间相交时交叠须达到最短时长，分离时空档须
+    不超过最大值；首个无法满足的交班步标记缺席 / 空档超限 / 交叠不足并
+    给出首个违规时刻，其后交班一律不再到达。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    task = _get_relay_task(db, fence_id, task_id)
+    members = _relay_members(db, task.id)
+
+    events = (
+        db.query(Event)
+        .filter(
+            Event.fence_id == fence_id,
+            Event.type.in_([EVENT_ENTER, EVENT_LEAVE]),
+            Event.device_id.in_(members),
+        )
+        .all()
+    )
+    report = compute_relay_report(
+        [(e.device_id, e.type, e.ts) for e in events],
+        members,
+        task.start_ts,
+        task.end_ts,
+        task.max_gap_s,
+        task.min_overlap_s,
+    )
+    base = relay_task_out(db, task).model_dump()
+    return RelayReportOut(
+        **base,
+        passed_steps=report.passed_steps,
+        passed=report.passed,
+        first_violation_at=to_iso(report.first_violation_ts),
+        device_results=[
+            RelayDeviceOut(
+                position=d.position,
+                device_id=d.device_id,
+                status=d.status,
+                interval=_relay_interval_out(d.interval),
+            )
+            for d in report.devices
+        ],
+        steps=[
+            RelayStepOut(
+                position=s.position,
+                from_device=s.from_device,
+                to_device=s.to_device,
+                status=s.status,
+                takeover_at=to_iso(s.takeover_ts),
+                from_interval=_relay_interval_out(s.from_interval),
+                to_interval=_relay_interval_out(s.to_interval),
+                overlap_s=s.overlap_s,
+                gap_s=s.gap_s,
+                first_violation_at=to_iso(s.first_violation_ts),
+            )
+            for s in report.steps
         ],
     )
 

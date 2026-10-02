@@ -291,3 +291,103 @@ class RendezvousReportOut(RendezvousTaskOut):
     segments: list[RendezvousSegmentOut] = Field(
         description="达标的共同在场连续片段，按起止时刻升序；无达标片段为空数组"
     )
+
+
+# ---------- 设备接力交班核验 ----------
+
+
+class RelayTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="接力交班任务名称")
+    devices: list[str] = Field(
+        min_length=2, max_length=8,
+        description="按交班顺序排列的设备 ID 列表（2～8 台，不得重复）",
+    )
+    start_at: datetime = Field(description="有效窗口开始时刻（ISO 8601），含该时刻")
+    end_at: datetime = Field(description="有效窗口结束时刻（ISO 8601），不含，必须晚于开始")
+    max_gap_s: float = Field(
+        ge=0, description="相邻交班允许的最大空档（秒，非负）；空档等于该值即算允许"
+    )
+    min_overlap_s: float = Field(
+        ge=0, description="相邻交班要求的最短交叠时长（秒，非负）；交叠等于该值即算达标"
+    )
+
+    @model_validator(mode="after")
+    def check_devices_and_window(self):
+        if any(not d.strip() for d in self.devices):
+            raise ValueError("设备 ID 不得为空")
+        if len(set(self.devices)) != len(self.devices):
+            raise ValueError("交班设备 ID 不得重复")
+        if not self.start_at < self.end_at:
+            raise ValueError("开始时刻必须早于结束时刻")
+        return self
+
+
+class RelayTaskOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    devices: list[str] = Field(description="按交班顺序排列的设备 ID")
+    start_at: datetime
+    end_at: datetime
+    max_gap_s: float
+    min_overlap_s: float
+    created_at: datetime
+
+
+class RelayIntervalOut(BaseModel):
+    start: datetime = Field(description="半开在场区间起端（已截断到有效窗口，含）")
+    end: datetime = Field(description="半开在场区间止端（已截断到有效窗口，不含）")
+
+
+class RelayDeviceOut(BaseModel):
+    position: int = Field(description="交班顺序序号（从 0 起）")
+    device_id: str
+    status: Literal["present", "failed", "absent", "not_reached"] = Field(
+        description="present=已选入交班链；failed=在场但该步交班未达标；"
+                    "absent=窗口内缺席（或无满足时间推进的区间）；"
+                    "not_reached=交班链此前已终止，不参与核验"
+    )
+    interval: RelayIntervalOut | None = Field(
+        description="该设备在交班链中的实际（截断）区间；absent/not_reached 为 null"
+    )
+
+
+class RelayStepOut(BaseModel):
+    position: int = Field(description="交班步序号（从 0 起：devices[position] -> devices[position+1]）")
+    from_device: str
+    to_device: str
+    status: Literal[
+        "passed", "absent", "gap_exceeded", "overlap_insufficient", "not_reached"
+    ] = Field(
+        description="passed=交叠达标或空档不超限；absent=接班设备缺席；"
+                    "gap_exceeded=分离且空档超限；"
+                    "overlap_insufficient=相交但交叠不足；not_reached=此前已失败"
+    )
+    takeover_at: datetime | None = Field(
+        description="接班时刻（接班设备实际区间起端）；缺席/未到达为 null"
+    )
+    from_interval: RelayIntervalOut | None = Field(description="交班设备实际区间；未到达为 null")
+    to_interval: RelayIntervalOut | None = Field(
+        description="接班设备实际区间；缺席/未到达为 null"
+    )
+    overlap_s: float | None = Field(
+        description="实际交叠秒数；两区间相交时给出（半开：起端严格早于交班区间止端）"
+    )
+    gap_s: float | None = Field(
+        description="实际空档秒数；两区间分离（含端点相接）时给出"
+    )
+    first_violation_at: datetime | None = Field(
+        description="该步首个违规时刻；达标/未到达为 null"
+    )
+
+
+class RelayReportOut(RelayTaskOut):
+    passed_steps: int = Field(description="交班链中通过的相邻交班步数")
+    passed: bool = Field(description="全部相邻交班步是否通过")
+    first_violation_at: datetime | None = Field(
+        description="整条链的首个违规时刻；全部通过为 null"
+    )
+    device_results: list[RelayDeviceOut] = Field(
+        description="按交班顺序的每台设备实际区间与状态"
+    )
+    steps: list[RelayStepOut] = Field(description="每个相邻交班步的实际区间与状态")
