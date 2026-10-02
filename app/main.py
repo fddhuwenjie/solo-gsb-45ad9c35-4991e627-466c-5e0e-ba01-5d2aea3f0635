@@ -21,6 +21,7 @@ from .engine import (
     compute_clearance,
     compute_crossings,
     compute_events,
+    compute_handover_report,
     compute_inspection_report,
     compute_occupancy_segments,
     compute_rendezvous_report,
@@ -35,6 +36,8 @@ from .models import (
     Event,
     Fence,
     GateLineRow,
+    HandoverMemberRow,
+    HandoverTask,
     InspectionCheckpointRow,
     InspectionRouteRow,
     RendezvousMemberRow,
@@ -58,6 +61,10 @@ from .schemas import (
     FenceStateOut,
     GateLineCreate,
     GateLineOut,
+    HandoverReportOut,
+    HandoverStepOut,
+    HandoverTaskCreate,
+    HandoverTaskOut,
     IngestResult,
     InspectionCheckpointOut,
     InspectionCheckpointResultOut,
@@ -98,8 +105,8 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="轨迹围栏事件 API",
     description="带孔多边形围栏 + 乱序轨迹重排 + 缓冲/停留去抖的 enter/leave/stay 事件服务，"
-                "支持围栏容量核算、定向门线穿越核算、应急清场核验与协同到场核验",
-    version="1.5.0",
+                "支持围栏容量核算、定向门线穿越核算、应急清场核验、协同到场核验与设备接力交班核验",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
@@ -259,6 +266,15 @@ def delete_fence(fence_id: int, db: Session = Depends(get_db)):
             RendezvousMemberRow.task_id.in_(task_ids)
         ).delete(synchronize_session=False)
     db.query(RendezvousTask).filter_by(fence_id=fence_id).delete()
+    handover_ids = [
+        t[0]
+        for t in db.query(HandoverTask.id).filter_by(fence_id=fence_id).all()
+    ]
+    if handover_ids:
+        db.query(HandoverMemberRow).filter(
+            HandoverMemberRow.task_id.in_(handover_ids)
+        ).delete(synchronize_session=False)
+    db.query(HandoverTask).filter_by(fence_id=fence_id).delete()
     route_ids = [
         r[0]
         for r in db.query(InspectionRouteRow.id).filter_by(fence_id=fence_id).all()
@@ -1128,6 +1144,164 @@ def rendezvous_report(fence_id: int, task_id: int, db: Session = Depends(get_db)
                 members=list(s.members),
             )
             for s in report.segments
+        ],
+    )
+
+
+# ---------- 设备接力交班核验 ----------
+
+
+def _handover_members(db: Session, task_id: int) -> list[str]:
+    rows = (
+        db.query(HandoverMemberRow)
+        .filter_by(task_id=task_id)
+        .order_by(HandoverMemberRow.position)
+        .all()
+    )
+    return [r.device_id for r in rows]
+
+
+def handover_task_out(db: Session, task: HandoverTask) -> HandoverTaskOut:
+    return HandoverTaskOut(
+        id=task.id,
+        fence_id=task.fence_id,
+        name=task.name,
+        members=_handover_members(db, task.id),
+        start_at=to_iso(task.start_ts),
+        end_at=to_iso(task.end_ts),
+        max_gap_s=task.max_gap_s,
+        min_overlap_s=task.min_overlap_s,
+        created_at=to_iso(task.created_at),
+    )
+
+
+def _get_handover_task(db: Session, fence_id: int, task_id: int) -> HandoverTask:
+    task = db.get(HandoverTask, task_id)
+    if task is None or task.fence_id != fence_id:
+        raise HTTPException(status_code=404, detail="交班任务不存在")
+    return task
+
+
+@app.post(
+    "/fences/{fence_id}/handover-tasks",
+    response_model=HandoverTaskOut,
+    status_code=201,
+)
+def create_handover_task(
+    fence_id: int, body: HandoverTaskCreate, db: Session = Depends(get_db)
+):
+    """创建设备接力交班任务：2～8 台按交班顺序排列且不重复的设备。
+
+    另需半开有效窗口（开始严格早于结束）、相邻交班允许的最大空档
+    max_gap_s（非负）与最短交叠时长 min_overlap_s（正数）。成员数量、
+    重复、空 ID、窗口无效或时长非法均返回 422；围栏不存在返回 404。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    start_ts, end_ts = to_epoch(body.start_at), to_epoch(body.end_at)
+    if not start_ts < end_ts:
+        raise HTTPException(status_code=422, detail="开始时刻必须早于结束时刻")
+
+    task = HandoverTask(
+        fence_id=fence_id,
+        name=body.name,
+        start_ts=start_ts,
+        end_ts=end_ts,
+        max_gap_s=body.max_gap_s,
+        min_overlap_s=body.min_overlap_s,
+        created_at=datetime.now(timezone.utc).timestamp(),
+    )
+    db.add(task)
+    db.flush()  # 取得 task.id
+    for position, device_id in enumerate(body.members):
+        db.add(HandoverMemberRow(
+            task_id=task.id, position=position, device_id=device_id
+        ))
+    db.commit()
+    db.refresh(task)
+    return handover_task_out(db, task)
+
+
+@app.get(
+    "/fences/{fence_id}/handover-tasks",
+    response_model=list[HandoverTaskOut],
+)
+def list_handover_tasks(fence_id: int, db: Session = Depends(get_db)):
+    """列出围栏的接力交班任务（按 id 升序），设备按交班顺序。"""
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    tasks = (
+        db.query(HandoverTask)
+        .filter_by(fence_id=fence_id)
+        .order_by(HandoverTask.id)
+        .all()
+    )
+    return [handover_task_out(db, t) for t in tasks]
+
+
+@app.delete(
+    "/fences/{fence_id}/handover-tasks/{task_id}",
+    status_code=204,
+)
+def delete_handover_task(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    task = _get_handover_task(db, fence_id, task_id)
+    db.query(HandoverMemberRow).filter_by(task_id=task.id).delete()
+    db.delete(task)
+    db.commit()
+
+
+@app.get(
+    "/fences/{fence_id}/handover-tasks/{task_id}/report",
+    response_model=HandoverReportOut,
+)
+def handover_report(fence_id: int, task_id: int, db: Session = Depends(get_db)):
+    """查询设备接力交班核验报告：每次由当前 enter/leave 事件实时重建。
+
+    从事件还原每台交班设备截断到有效窗口的半开在场区间 [enter, leave)，
+    选择通过的相邻交班步数最多的连续交班链（相交须交叠达到最短时长，
+    分离须空档不超过最大值）；并列时按各步接班时刻字典序最早。无法满足
+    时标记 absent / gap_exceeded / overlap_insufficient 并停止后续交班
+    （其余为 not_reached）。返回每步实际区间、状态与首个违规时刻。
+    """
+    if db.get(Fence, fence_id) is None:
+        raise HTTPException(status_code=404, detail="围栏不存在")
+    task = _get_handover_task(db, fence_id, task_id)
+    members = _handover_members(db, task.id)
+
+    events = (
+        db.query(Event)
+        .filter(
+            Event.fence_id == fence_id,
+            Event.type.in_([EVENT_ENTER, EVENT_LEAVE]),
+            Event.device_id.in_(members),
+        )
+        .all()
+    )
+    report = compute_handover_report(
+        [(e.device_id, e.type, e.ts) for e in events],
+        members,
+        task.start_ts,
+        task.end_ts,
+        task.max_gap_s,
+        task.min_overlap_s,
+    )
+    base = handover_task_out(db, task).model_dump()
+    return HandoverReportOut(
+        **base,
+        passed=report.passed,
+        passed_steps=report.passed_steps,
+        first_violation_at=to_iso(report.first_violation_ts),
+        steps=[
+            HandoverStepOut(
+                position=s.position,
+                device_id=s.device_id,
+                interval_start=to_iso(s.interval_start),
+                interval_end=to_iso(s.interval_end),
+                status=s.status,
+                takeover_at=to_iso(s.takeover_ts),
+                violation_at=to_iso(s.violation_ts),
+            )
+            for s in report.steps
         ],
     )
 

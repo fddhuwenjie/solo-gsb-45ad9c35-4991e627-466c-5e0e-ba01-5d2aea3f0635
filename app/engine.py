@@ -28,6 +28,14 @@
 并截断到窗口，在合并后的时间边界上扫描全体成员同时在场的连续片段；
 成员反复进出会形成多个候选片段，只有窗口内持续时长达到（含）门槛的片段
 才算通过，任一达标即整体通过，无达标片段即失败。
+
+设备接力交班核验：任务指定 2～8 台按交班顺序排列且不重复的设备、有效
+窗口 [start, end)、相邻交班允许的最大空档与最短交叠时长。由 enter/leave
+事件还原每台设备截断到窗口的半开在场区间，在“区间节点 + 相邻序号连边”
+的有向图上动态规划，选择通过的相邻交班步数最多的连续交班链；并列时按
+各步接班时刻组成的元组字典序最早。两段相交要求交叠达到最短时长，分离
+要求空档不超过最大值；无法满足时按缺席 / 空档超限 / 交叠不足标记并停止
+后续交班。
 """
 from __future__ import annotations
 
@@ -853,4 +861,253 @@ def compute_rendezvous_report(
         min_co_presence_s=min_co_presence_s,
         members=ordered_members,
         segments=segments,
+    )
+
+
+# ---------- 设备接力交班核验 ----------
+
+
+HANDOVER_PASSED = "passed"                        # 链上交班通过
+HANDOVER_ABSENT = "absent"                        # 窗口内无满足时间推进的在场区间
+HANDOVER_GAP_EXCEEDED = "gap_exceeded"            # 两段分离且空档超过最大值
+HANDOVER_OVERLAP_INSUFFICIENT = "overlap_insufficient"  # 两段相交但交叠不足最短时长
+HANDOVER_NOT_REACHED = "not_reached"              # 交班在此前失败后停止
+
+
+@dataclass
+class HandoverStep:
+    """交班链上一个序号（一台设备）的核验结果。"""
+
+    position: int
+    device_id: str
+    status: str
+    interval_start: float | None = None   # 实际采用区间（截断到窗口）起端；无区间为 None
+    interval_end: float | None = None     # 实际采用区间止端；未离开取窗口结束
+    takeover_ts: float | None = None      # 接班时刻 = 区间起端；首台即到岗时刻
+    violation_ts: float | None = None     # 首个违规时刻
+
+
+@dataclass
+class HandoverReport:
+    """接力交班核验报告：steps 按交班顺序排列。"""
+
+    start: float
+    end: float
+    max_gap_s: float
+    min_overlap_s: float
+    members: tuple[str, ...]
+    steps: list[HandoverStep]
+
+    @property
+    def passed(self) -> bool:
+        return len(self.steps) > 0 and all(
+            s.status == HANDOVER_PASSED for s in self.steps
+        )
+
+    @property
+    def passed_steps(self) -> int:
+        """通过的相邻交班步数（链上设备数 - 1，全失败为 0）。"""
+        on_chain = sum(1 for s in self.steps if s.status == HANDOVER_PASSED)
+        return max(0, on_chain - 1)
+
+    @property
+    def first_violation_ts(self) -> float | None:
+        for s in self.steps:
+            if s.violation_ts is not None:
+                return s.violation_ts
+        return None
+
+
+def _presence_intervals_leave_first(
+    events: list[tuple[str, str, float]]
+) -> dict[str, list[tuple[float, float]]]:
+    """由 enter/leave 事件按设备重放半开在场区间 [enter, leave)。
+
+    与 presence_intervals 的区别：同一设备同一时刻既有 leave 又有 enter 时
+    **离开先配对**（与协同到场扫描线的半开边界一致）——旧区间止端不含 t、
+    新区间起端含 t。未配对的 enter 止端取 +inf，交由调用方按窗口截断。
+    """
+    by_device: dict[str, list[tuple[float, str]]] = {}
+    for device_id, etype, ts in events:
+        if etype in (EVENT_ENTER, EVENT_LEAVE):
+            by_device.setdefault(device_id, []).append((ts, etype))
+
+    result: dict[str, list[tuple[float, float]]] = {}
+    for device_id, evs in by_device.items():
+        evs.sort(key=lambda x: (x[0], 0 if x[1] == EVENT_LEAVE else 1))
+        intervals: list[tuple[float, float]] = []
+        open_since: float | None = None
+        for ts, etype in evs:
+            if etype == EVENT_ENTER:
+                if open_since is None:
+                    open_since = ts
+            elif open_since is not None:
+                intervals.append((open_since, ts))
+                open_since = None
+        if open_since is not None:
+            intervals.append((open_since, math.inf))
+        result[device_id] = intervals
+    return result
+
+
+def compute_handover_report(
+    events: list[tuple[str, str, float]],
+    members: list[str],
+    start: float,
+    end: float,
+    max_gap_s: float,
+    min_overlap_s: float,
+) -> HandoverReport:
+    """由 enter/leave 事件还原接力交班核验报告。
+
+    各设备在场区间一律为半开区间 [enter, leave)，截断到有效窗口
+    [start, end)（窗口前已进入、窗口结束仍未离开的区间正确截断）。
+
+    交班链选择（动态规划）：把每台设备的每个窗口内区间视为一个节点，
+    相邻序号 i -> i+1 的两个区间在时间推进（接班区间起端不早于接班时刻）
+    且满足交班约束时连边——两段相交（接班起端 < 交班止端）要求交叠时长
+    >= min_overlap_s（含等于）；两段分离（接班起端 >= 交班止端）要求空档
+    <= max_gap_s（含等于，首尾相接空档为 0）。选择通过的相邻交班步数最多
+    的链；并列时按各步接班时刻组成的元组字典序最早（首步并列取最早到岗）。
+
+    链一旦无法延伸即停止：接班设备无满足时间推进的区间记 absent；
+    有区间但最早候选交叠不足记 overlap_insufficient、空档超限记
+    gap_exceeded（违规时刻分别为交叠结束时刻与空档超限时刻），
+    其余序号记 not_reached。
+    """
+    per_device = _presence_intervals_leave_first(events)
+
+    # 每台设备截断到窗口 [start, end) 的非空区间，按起端升序
+    clipped: list[list[tuple[float, float]]] = []
+    for dev in members:
+        ivs = []
+        for s, e in per_device.get(dev, []):
+            cs, ce = max(s, start), min(e, end)
+            if cs < ce:
+                ivs.append((cs, ce))
+        ivs.sort()
+        clipped.append(ivs)
+
+    def valid_edge(a: tuple[float, float], b: tuple[float, float]) -> bool:
+        """交班区间 a -> 接班区间 b 是否满足约束（已隐含时间推进 b.s >= a.s）。"""
+        if b[0] < a[1]:  # 两段相交：交叠 = min(止端) - 接班起端
+            return min(a[1], b[1]) - b[0] >= min_overlap_s
+        return b[0] - a[1] <= max_gap_s  # 分离（含首尾相接）：空档 <= 上限
+
+    # best[position][j] = 以 clipped[position][j] 结尾的最优前缀
+    # 取值 (通过步数, 接班时刻元组, 首步区间下标, 前驱 position, 前驱 j)
+    best: list[list[tuple]] = []
+    best.append([(0, (), j, -1, -1) for j in range(len(clipped[0]))])
+    for pos in range(1, len(members)):
+        cur: list[tuple] = []
+        for js, je in clipped[pos]:
+            choice = None
+            for k, (ps, pe) in enumerate(clipped[pos - 1]):
+                prev = best[pos - 1][k]
+                if prev is None or js < ps:
+                    continue  # 接班区间起端不得早于前一步接班时刻
+                if not valid_edge((ps, pe), (js, je)):
+                    continue
+                candidate = (prev[0] + 1, prev[1] + (js,), prev[2], pos - 1, k)
+                if choice is None or (candidate[0], candidate[1]) > (choice[0], choice[1]):
+                    choice = candidate
+            cur.append(choice)  # type: ignore[arg-type]
+        best.append(cur)
+
+    # 全局最优：通过步数最多；并列按各步接班时刻元组字典序最早；
+    # 再并列取首台设备最早到岗区间（确定性）
+    winner: tuple | None = None
+    winner_pos = winner_j = -1
+    winner_first_start = math.inf
+    for pos in range(len(members)):
+        for j, cand in enumerate(best[pos]):
+            if cand is None:
+                continue
+            first_start = clipped[0][cand[2]][0]
+            if (
+                cand[0] > (winner[0] if winner else -1)
+                or (winner is not None and cand[0] == winner[0] and cand[1] < winner[1])
+                or (
+                    winner is not None
+                    and cand[0] == winner[0]
+                    and cand[1] == winner[1]
+                    and first_start < winner_first_start
+                )
+            ):
+                winner, winner_pos, winner_j, winner_first_start = (
+                    cand, pos, j, first_start,
+                )
+
+    steps: list[HandoverStep] = []
+    if winner is None:
+        # 首台设备窗口内无任何在场区间：缺席并停止后续交班
+        for pos, dev in enumerate(members):
+            steps.append(HandoverStep(
+                position=pos,
+                device_id=dev,
+                status=HANDOVER_ABSENT if pos == 0 else HANDOVER_NOT_REACHED,
+                violation_ts=start if pos == 0 else None,
+            ))
+        return HandoverReport(
+            start=start, end=end, max_gap_s=max_gap_s,
+            min_overlap_s=min_overlap_s, members=tuple(members), steps=steps,
+        )
+
+    # 回溯选出的链
+    chain_nodes: list[tuple[float, float] | None] = [None] * len(members)
+    pos, j = winner_pos, winner_j
+    while pos >= 0:
+        chain_nodes[pos] = clipped[pos][j]
+        _, _, _, ppos, pj = best[pos][j]
+        pos, j = ppos, pj
+
+    for pos, dev in enumerate(members):
+        iv = chain_nodes[pos]
+        if iv is not None:
+            steps.append(HandoverStep(
+                position=pos,
+                device_id=dev,
+                status=HANDOVER_PASSED,
+                interval_start=iv[0],
+                interval_end=iv[1],
+                takeover_ts=iv[0],
+            ))
+            continue
+
+        if pos == winner_pos + 1:
+            # 交班失败的接班序号：依据最早满足时间推进的候选判定原因
+            prev_iv = chain_nodes[pos - 1]
+            assert prev_iv is not None
+            candidates = [iv for iv in clipped[pos] if iv[0] >= prev_iv[0]]
+            if not candidates:
+                steps.append(HandoverStep(
+                    position=pos, device_id=dev, status=HANDOVER_ABSENT,
+                    violation_ts=end,
+                ))
+            else:
+                cs, ce = candidates[0]
+                if cs < prev_iv[1]:
+                    status = HANDOVER_OVERLAP_INSUFFICIENT
+                    violation_ts = min(prev_iv[1], ce)
+                else:
+                    status = HANDOVER_GAP_EXCEEDED
+                    violation_ts = prev_iv[1] + max_gap_s
+                steps.append(HandoverStep(
+                    position=pos, device_id=dev, status=status,
+                    interval_start=cs, interval_end=ce, takeover_ts=cs,
+                    violation_ts=violation_ts,
+                ))
+        else:
+            # 交班已在此前停止
+            steps.append(HandoverStep(
+                position=pos, device_id=dev, status=HANDOVER_NOT_REACHED,
+            ))
+
+    return HandoverReport(
+        start=start,
+        end=end,
+        max_gap_s=max_gap_s,
+        min_overlap_s=min_overlap_s,
+        members=tuple(members),
+        steps=steps,
     )

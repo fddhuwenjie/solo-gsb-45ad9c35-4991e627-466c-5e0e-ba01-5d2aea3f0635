@@ -11,6 +11,7 @@
 - **有序门线巡检路线核验**：路线保存 2～8 个按序排列的门线检查点（门线 + 方向 + 与上一点的最长间隔，首点无间隔）；核验设备在 `[start, end)` 窗口内是否按序、按方向且不超间隔地逐点通过，报告实时由当前穿越记录重算
 - **应急清场核验**：为围栏创建含名称、开始时刻、截止时刻的清场任务；报告从 enter/leave 事件实时还原起始在场名单并逐机核验 cleared/remaining
 - **协同到场核验**：为围栏创建 2～8 台设备组成的协同任务（有效窗口 + 最短共同在场时长，设备不得重复）；报告从 enter/leave 事件实时还原各设备半开在场区间，求全体成员共同在场的连续片段，只有窗口内持续达到时长的片段才算通过
+- **设备接力交班核验**：为围栏创建 2～8 台**按交班顺序排列且不重复**的设备（有效窗口 + 相邻交班允许的最大空档 + 最短交叠时长）；报告从 enter/leave 事件实时还原每台设备的半开在场区间，选择通过相邻交班步数最多的连续交班链，返回每步实际区间、状态与首个违规时刻
 - 按时间范围/设备/围栏/类型查询事件，查询设备当前状态
 
 ## 快速开始（Docker Compose 一键启动）
@@ -463,13 +464,94 @@ curl http://localhost:8000/fences/1/rendezvous-tasks/1/report
 5. **实时重建、无快照**：报告**每次查询都从当前事件重建**，不落库任何结果。补录乱序轨迹点（包括更早的点）触发事件重算后，再次查询即按最新事件重算片段，旧片段不残留。
 6. 围栏/任务不存在或任务不属于该围栏返回 `404`。
 
+### 13. 设备接力交班核验
+
+为围栏创建接力交班任务：**2～8 台**按交班顺序排列的设备（设备 ID **不得重复、不得为空**）、半开有效窗口 `[start_at, end_at)`、相邻交班两段区间**分离时允许的最大空档** `max_gap_s`（秒，非负）与两段**相交时要求的最短交叠** `min_overlap_s`（秒，正数）。
+
+```bash
+curl -X POST http://localhost:8000/fences/1/handover-tasks \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "name": "昼夜班接力",
+    "members": ["dev-A", "dev-B", "dev-C"],
+    "start_at": "2026-10-02T08:00:00Z",
+    "end_at": "2026-10-02T09:00:00Z",
+    "max_gap_s": 60,
+    "min_overlap_s": 30
+  }'
+```
+
+- 创建校验：设备数量必须为 **2～8**；**设备 ID 不得重复、不得为空**（否则 `422`）；窗口必须有效（`start_at < end_at`，否则 `422`）；`max_gap_s` 必须非负、`min_overlap_s` 必须为正（否则 `422`）；围栏不存在返回 `404`。
+- 管理接口：`GET /fences/1/handover-tasks`（按 id 升序，设备按交班顺序）、`DELETE /fences/1/handover-tasks/{task_id}`；**删除围栏时其交班任务与交班设备一并删除**。
+
+三台设备按序交班（沿用第 1 节围栏，默认配置无缓冲/dwell；`dev-A` 窗口前已在场，`dev-C` 交班后未离开）：
+
+```bash
+curl -X POST http://localhost:8000/points -H 'Content-Type: application/json' \
+  -d '{"points": [
+    {"device_id": "dev-A", "ts": "2026-10-02T07:55:00Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-A", "ts": "2026-10-02T08:10:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-B", "ts": "2026-10-02T08:09:00Z", "lat": 39.910, "lon": 116.310},
+    {"device_id": "dev-B", "ts": "2026-10-02T08:31:00Z", "lat": 39.894, "lon": 116.294},
+    {"device_id": "dev-C", "ts": "2026-10-02T08:30:00Z", "lat": 39.910, "lon": 116.310}
+  ]}'
+
+curl http://localhost:8000/fences/1/handover-tasks/1/report
+```
+
+返回示例（A→B 交叠 60s、B→C 交叠 60s，均 ≥ 30s，两步全部通过）：
+
+```json
+{
+  "id": 1,
+  "fence_id": 1,
+  "name": "昼夜班接力",
+  "members": ["dev-A", "dev-B", "dev-C"],
+  "start_at": "2026-10-02T08:00:00Z",
+  "end_at": "2026-10-02T09:00:00Z",
+  "max_gap_s": 60.0,
+  "min_overlap_s": 30.0,
+  "created_at": "2026-10-02T07:50:00Z",
+  "passed": true,
+  "passed_steps": 2,
+  "first_violation_at": null,
+  "steps": [
+    {"position": 0, "device_id": "dev-A",
+     "interval_start": "2026-10-02T08:00:00Z", "interval_end": "2026-10-02T08:10:00Z",
+     "status": "passed", "takeover_at": "2026-10-02T08:00:00Z", "violation_at": null},
+    {"position": 1, "device_id": "dev-B",
+     "interval_start": "2026-10-02T08:09:00Z", "interval_end": "2026-10-02T08:31:00Z",
+     "status": "passed", "takeover_at": "2026-10-02T08:09:00Z", "violation_at": null},
+    {"position": 2, "device_id": "dev-C",
+     "interval_start": "2026-10-02T08:30:00Z", "interval_end": "2026-10-02T09:00:00Z",
+     "status": "passed", "takeover_at": "2026-10-02T08:30:00Z", "violation_at": null}
+  ]
+}
+```
+
+**核验语义**：
+
+1. **半开在场区间还原**：报告由该围栏当前的 `enter`/`leave` 事件重放，各设备在场时间一律为半开区间 **`[enter, leave)`**，并截断到有效窗口 `[start_at, end_at)`；窗口前已进入、窗口结束仍未离开的区间正确截断（`dev-A` 起端截到 `08:00`、`dev-C` 止端截到 `09:00`）。同一设备同刻离开又进入时按离开先配对（旧区间止端不含该刻、新区间起端含该刻），与协同到场的半开边界一致。
+2. **交班约束**：对交班设备区间 `I` 与接班设备区间 `J`（接班起端不得早于交班设备的接班时刻，即多次进出严格**按时间推进**）：
+   - 两段**相交**（`J` 起端 < `I` 止端）：交叠时长 `min(I.end, J.end) - J.start` **必须 ≥ `min_overlap_s`**（含等于）；
+   - 两段**分离**（`J` 起端 ≥ `I` 止端，含首尾相接空档 0）：空档 `J.start - I.end` **必须 ≤ `max_gap_s`**（含等于）。
+3. **最长链 + 字典序并列**：一台设备多次进出会产生多个候选区间。以每个区间为节点、相邻序号间满足上述约束为边，选择**通过的相邻交班步数最多**的连续交班链；步数并列时，按各步**接班时刻**（接班区间起端组成的元组）**字典序最早**取链；首步仍并列时取最早到岗区间。
+4. **失败与停止**：链无法继续延伸的第一个接班序号标记失败，**其后所有序号为 `not_reached`，不再交班**：
+   - `absent`：窗口内无满足时间推进的在场区间（首台设备窗口内从无在场区间也算缺席）；
+   - `gap_exceeded`：最早候选区间可接但与上一段分离且空档超限，首个违规时刻为**上一段止端 + `max_gap_s`**（空档超限时刻）；
+   - `overlap_insufficient`：最早候选区间可接但交叠不足，首个违规时刻为**交叠结束时刻** `min(I.end, J.end)`；
+   - `absent` 的违规时刻取窗口结束（首台缺席取窗口开始）。
+5. **结果字段**：`passed_steps` 为通过的相邻交班步数（链上设备数 − 1）；`passed` 仅当全部序号均为 `passed`；`first_violation_at` 为链上首个违规时刻（全部通过为 `null`）；`steps` 按交班顺序给出每台设备实际采用的 `interval_start`/`interval_end`、`status`、`takeover_at`（接班时刻）与 `violation_at`。
+6. **实时重建、无快照**：报告**每次查询都从当前事件重建**，不落库任何结果。补录乱序轨迹点（包括更早的点）触发事件重算后，再次查询即按最新事件重算交班链，旧链与旧违规不残留。
+7. 围栏/任务不存在或任务不属于该围栏返回 `404`。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/fences` | 创建围栏（GeoJSON Polygon，支持孔洞，附判定配置） |
 | GET | `/fences` / `/fences/{id}` | 围栏列表 / 详情 |
-| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务、协同任务 |
+| DELETE | `/fences/{id}` | 删除围栏及其事件、状态、容量规则、门线、清场任务、协同任务、交班任务 |
 | POST | `/points` | 批量提交轨迹点（乱序重排、重复幂等） |
 | GET | `/events` | 事件查询（device_id / fence_id / type / start / end / limit / offset） |
 | GET | `/devices/{device_id}/status` | 设备当前相对各围栏的状态 |
@@ -493,6 +575,10 @@ curl http://localhost:8000/fences/1/rendezvous-tasks/1/report
 | GET | `/fences/{id}/rendezvous-tasks` | 协同任务列表（按 id 升序，成员按提交顺序） |
 | DELETE | `/fences/{id}/rendezvous-tasks/{task_id}` | 删除协同任务及其成员（删除围栏时一并删除） |
 | GET | `/fences/{id}/rendezvous-tasks/{task_id}/report` | 协同到场报告（实时由事件重建：全员共同在场达标片段起止/秒数/成员 + passed） |
+| POST | `/fences/{id}/handover-tasks` | 新建设备接力交班任务（2～8 台按序不重复设备 + 有效窗口 + 最大空档 + 最短交叠） |
+| GET | `/fences/{id}/handover-tasks` | 交班任务列表（按 id 升序，设备按交班顺序） |
+| DELETE | `/fences/{id}/handover-tasks/{task_id}` | 删除交班任务及其交班设备（删除围栏时一并删除） |
+| GET | `/fences/{id}/handover-tasks/{task_id}/report` | 接力交班报告（实时由事件重建：最长连续交班链 + 每步实际区间/状态/接班时刻/首个违规时刻） |
 | GET | `/health` | 健康检查 |
 
 ## 围栏配置参数
@@ -522,11 +608,11 @@ uvicorn app.main:app --reload --port 8000   # 本地启动
 ```
 app/
   main.py      # FastAPI 路由与摄入/重算流程
-  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验、有序门线巡检路线核验、协同到场核验
-  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints / rendezvous_tasks / rendezvous_members）
+  engine.py    # 投影、缓冲迟滞 + dwell 状态机（事件判定核心）、容量占用分段、门线穿越核算、应急清场核验、有序门线巡检路线核验、协同到场核验、设备接力交班核验
+  models.py    # SQLAlchemy 模型（fences / points / events / device_state / capacity_rules / gate_lines / crossings / clearance_tasks / inspection_routes / inspection_checkpoints / rendezvous_tasks / rendezvous_members / handover_tasks / handover_members）
   schemas.py   # Pydantic 请求/响应模型
   database.py  # SQLite 连接与会话
-tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验）
+tests/         # pytest 端到端测试（孔洞、乱序、幂等、抖动、停留、查询、容量核算、门线穿越、清场核验、巡检路线核验、协同到场核验、接力交班核验）
 Dockerfile / docker-compose.yml
 ```
 

@@ -291,3 +291,78 @@ class RendezvousReportOut(RendezvousTaskOut):
     segments: list[RendezvousSegmentOut] = Field(
         description="达标的共同在场连续片段，按起止时刻升序；无达标片段为空数组"
     )
+
+
+# ---------- 设备接力交班核验 ----------
+
+
+class HandoverTaskCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200, description="交班任务名称")
+    members: list[str] = Field(
+        min_length=2, max_length=8, description="按交班顺序排列的设备 ID（2～8 台，不得重复）"
+    )
+    start_at: datetime = Field(description="有效窗口开始时刻（ISO 8601），含该时刻")
+    end_at: datetime = Field(description="有效窗口结束时刻（ISO 8601），不含，必须晚于开始")
+    max_gap_s: float = Field(
+        ge=0, description="相邻交班两段区间分离时允许的最大空档（秒，非负）；等于上限允许"
+    )
+    min_overlap_s: float = Field(
+        gt=0, description="相邻交班两段区间相交时要求的最短交叠（秒，正数）；等于门槛算达标"
+    )
+
+    @model_validator(mode="after")
+    def check_members_and_window(self):
+        if any(not m.strip() for m in self.members):
+            raise ValueError("设备 ID 不得为空")
+        if len(set(self.members)) != len(self.members):
+            raise ValueError("交班设备 ID 不得重复")
+        if not self.start_at < self.end_at:
+            raise ValueError("开始时刻必须早于结束时刻")
+        return self
+
+
+class HandoverTaskOut(BaseModel):
+    id: int
+    fence_id: int
+    name: str
+    members: list[str] = Field(description="按交班顺序排列的设备 ID")
+    start_at: datetime
+    end_at: datetime
+    max_gap_s: float
+    min_overlap_s: float
+    created_at: datetime
+
+
+class HandoverStepOut(BaseModel):
+    position: int = Field(description="交班序号（从 0 起）")
+    device_id: str
+    interval_start: datetime | None = Field(
+        description="该步实际采用的在场区间起端（截断到窗口）；无区间为 null"
+    )
+    interval_end: datetime | None = Field(
+        description="该步实际采用的在场区间止端（截断到窗口，未离开为窗口结束）；无区间为 null"
+    )
+    status: Literal[
+        "passed", "absent", "gap_exceeded", "overlap_insufficient", "not_reached"
+    ] = Field(
+        description="passed=链上通过；absent=窗口内无满足时间推进的在场区间；"
+                    "gap_exceeded=两段分离且空档超过最大值；"
+                    "overlap_insufficient=两段相交但交叠不足最短时长；"
+                    "not_reached=交班在此前失败后停止"
+    )
+    takeover_at: datetime | None = Field(
+        description="接班时刻（该步区间起端）；首台为其到岗时刻，未接班为 null"
+    )
+    violation_at: datetime | None = Field(
+        description="首个违规时刻：gap_exceeded 为空档超限时刻；"
+                    "overlap_insufficient 为交叠结束时刻；absent 为窗口结束（首台缺席为窗口开始）；其余为 null"
+    )
+
+
+class HandoverReportOut(HandoverTaskOut):
+    passed: bool = Field(description="全部交班步均通过（每台设备都在链上）")
+    passed_steps: int = Field(description="通过的相邻交班步数")
+    first_violation_at: datetime | None = Field(
+        description="链上首个违规时刻；全部通过为 null"
+    )
+    steps: list[HandoverStepOut] = Field(description="每个交班序号的实际区间与状态，按顺序排列")

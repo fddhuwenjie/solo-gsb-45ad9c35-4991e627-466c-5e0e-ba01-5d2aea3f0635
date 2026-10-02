@@ -148,3 +148,29 @@ class RendezvousMemberRow(Base):
     task_id: Mapped[int] = mapped_column(Integer, index=True)
     position: Mapped[int] = mapped_column(Integer)   # 成员在任务中的序号（0 起）
     device_id: Mapped[str] = mapped_column(String(100), index=True)
+
+
+class HandoverTask(Base):
+    __tablename__ = "handover_tasks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    fence_id: Mapped[int] = mapped_column(Integer, index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    start_ts: Mapped[float] = mapped_column(Float)        # 有效窗口开始（epoch 秒，含）
+    end_ts: Mapped[float] = mapped_column(Float)          # 有效窗口结束（epoch 秒，不含，须晚于开始）
+    max_gap_s: Mapped[float] = mapped_column(Float)       # 相邻交班允许的最大空档（秒，非负）
+    min_overlap_s: Mapped[float] = mapped_column(Float)   # 相邻交班要求的最短交叠（秒，正数）
+    created_at: Mapped[float] = mapped_column(Float)
+
+
+class HandoverMemberRow(Base):
+    __tablename__ = "handover_members"
+    # (task_id, position) 唯一：任务内交班序号唯一；position 从 0 起按交班顺序
+    __table_args__ = (
+        UniqueConstraint("task_id", "position", name="uq_handover_position"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    task_id: Mapped[int] = mapped_column(Integer, index=True)
+    position: Mapped[int] = mapped_column(Integer)   # 设备在交班顺序中的序号（0 起）
+    device_id: Mapped[str] = mapped_column(String(100), index=True)
